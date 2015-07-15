@@ -35,6 +35,7 @@ SRCS+=		rumpuser_sp.c
 .error Unsupported curlwp scheme for thread model: ${RUMP_CURLWP}
 .endif
 .endif
+CFLAGS+= -Wno-unused-function
 SRCS=		rumpfiber.c rumpfiber_bio.c
 SRCS+=		rumpfiber_sp.c
 .else

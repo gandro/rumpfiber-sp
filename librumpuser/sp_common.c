@@ -64,7 +64,7 @@
 #define __unused __attribute__((__unused__))
 #endif
 
-//#define DEBUG
+#define DEBUG
 #ifdef DEBUG
 #define DPRINTF(x) mydprintf x
 static void
