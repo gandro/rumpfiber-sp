@@ -94,7 +94,6 @@ __RCSID("$NetBSD: rumpfiber.c,v 1.12 2015/02/15 00:54:32 justin Exp $");
 static void init_sched(void);
 static void join_thread(struct thread *);
 static void switch_threads(struct thread *prev, struct thread *next);
-static struct thread *get_current(void);
 static int64_t now(void);
 static void msleep(uint64_t millisecs);
 static void abssleep(uint64_t millisecs);
@@ -117,7 +116,7 @@ printk(const char *msg)
 	ret = write(2, msg, strlen(msg));
 }
 
-static struct thread *
+struct thread *
 get_current(void)
 {
 

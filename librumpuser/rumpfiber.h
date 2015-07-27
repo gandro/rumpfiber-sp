@@ -63,6 +63,7 @@ int abssleep_real(uint64_t millisecs);
 struct thread* create_thread(const char *name, void *cookie,
 			     void (*f)(void *), void *data,
 			     void *stack, size_t stack_size);
+struct thread *get_current(void);
 int is_runnable(struct thread *);
 void set_runnable(struct thread *);
 void clear_runnable(struct thread *);

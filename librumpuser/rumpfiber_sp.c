@@ -1,5 +1,3 @@
-/*	$NetBSD: rumpfiber_sp.c,v 1.4 2015/02/15 00:54:32 justin Exp $	*/
-
 /*
  * Copyright (c) 2015 Sebastian Wicki.  All Rights Reserved.
  *
@@ -24,92 +22,36 @@
  * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
  * SUCH DAMAGE.
  */
+ 
+#define QUEUEDEBUG
+ 
 
 #include "rumpuser_port.h"
 
-#if !defined(lint)
-__RCSID("$NetBSD: rumpfiber_sp.c,v 1.4 2015/02/15 00:54:32 justin Exp $");
-#endif /* !lint */
+#include <sys/queue.h>
 
+#include <assert.h>
+#include <fcntl.h>
+#include <poll.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
 
-#include <rump/rump.h> /* XXX: for rfork flags */
+#include <rump/rump.h> /* for rfork flags */
 #include <rump/rumpuser.h>
 
 #include "rumpuser_int.h"
-
 #include "rumpfiber.h"
+#include "rumpuser_sp.h"
 
+#include "rumpsp_sock.c"
 
-////////// TODO use sp_common //////////
-/*
- * Bah, I hate writing on-off-wire conversions in C
- */
+#define PROTOMAJOR 0
+#define PROTOMINOR 4
 
-enum { RUMPSP_REQ, RUMPSP_RESP, RUMPSP_ERROR };
-enum {	RUMPSP_HANDSHAKE,
-	RUMPSP_SYSCALL,
-	RUMPSP_COPYIN, RUMPSP_COPYINSTR,
-	RUMPSP_COPYOUT, RUMPSP_COPYOUTSTR,
-	RUMPSP_ANONMMAP,
-	RUMPSP_PREFORK,
-	RUMPSP_RAISE };
-
-enum { HANDSHAKE_GUEST, HANDSHAKE_AUTH, HANDSHAKE_FORK, HANDSHAKE_EXEC };
-
-/*
- * error types used for RUMPSP_ERROR
- */
-enum rumpsp_err { RUMPSP_ERR_NONE = 0, RUMPSP_ERR_TRYAGAIN, RUMPSP_ERR_AUTH,
-	RUMPSP_ERR_INVALID_PREFORK, RUMPSP_ERR_RFORK_FAILED,
-	RUMPSP_ERR_INEXEC, RUMPSP_ERR_NOMEM, RUMPSP_ERR_MALFORMED_REQUEST };
-
-#define AUTHLEN 4 /* 128bit fork auth */
-
-struct rsp_hdr {
-	uint64_t rsp_len;
-	uint64_t rsp_reqno;
-	uint16_t rsp_class;
-	uint16_t rsp_type;
-	/*
-	 * We want this structure 64bit-aligned for typecast fun,
-	 * so might as well use the following for something.
-	 */
-	union {
-		uint32_t sysnum;
-		uint32_t error;
-		uint32_t handshake;
-		uint32_t signo;
-	} u;
-};
-#define HDRSZ sizeof(struct rsp_hdr)
-#define rsp_sysnum u.sysnum
-#define rsp_error u.error
-#define rsp_handshake u.handshake
-#define rsp_signo u.signo
-
-#define MAXBANNER 96
-
-/*
- * Data follows the header.  We have two types of structured data.
- */
-
-/* copyin/copyout */
-struct rsp_copydata {
-	size_t rcp_len;
-	void *rcp_addr;
-	uint8_t rcp_data[0];
-};
-
-/* syscall response */
-struct rsp_sysresp {
-	int rsys_error;
-	register_t rsys_retval[2];
-};
-
-#include <stdarg.h>
+#define DEBUG
+#ifdef DEBUG
 #define DPRINTF(x) mydprintf x
 static void
 mydprintf(const char *fmt, ...)
@@ -120,58 +62,91 @@ mydprintf(const char *fmt, ...)
 	vfprintf(stderr, fmt, ap);
 	va_end(ap);
 }
-
-#include <sys/socket.h>
-#include <sys/un.h>
-
-#include <assert.h>
-#include <fcntl.h>
-#include <poll.h>
-
-
-static char banner[MAXBANNER];
-
-#define PROTOMAJOR 0
-#define PROTOMINOR 4
-
-#ifndef MAXCLI
-#define MAXCLI 256
+#else
+#define DPRINTF(x)
 #endif
-
-struct spservarg {
-	int sps_sock;
-};
-
-#define CLI_STATE_NEW     0
-#define CLI_STATE_RUNNING 1
-#define CLI_STATE_DYING   2
-
-struct client {
-	int fd;
-	int state;
-	struct pollfd *poll_fd;
-	
-	struct lwp *spc_mainlwp;
-	pid_t spc_pid;
-
-	struct iovec *send_iov_base;
-	struct iovec *send_iov;
-	int send_iovcnt;
-
-	struct rsp_hdr recv_hdr;
-	uint8_t *recv_buf;
-	size_t recv_off;
-};
-
-static struct pollfd pfdlist[MAXCLI];
-static struct client clilist[MAXCLI];
 
 #define IOVPUT(_io_, _b_) _io_.iov_base = 			\
     (void *)&_b_; _io_.iov_len = sizeof(_b_);
 #define IOVPUT_WITHSIZE(_io_, _b_, _l_) _io_.iov_base =		\
     (void *)(_b_); _io_.iov_len = _l_;
-#define SENDIOV(_cli_, _iov_) enqueue_send(_cli_, _iov_, __arraycount(_iov_))
-////////// TODO split sp_common //////////
+#define SENDIOV(_cl_, _iov_) client_send(_cl_, _iov_, __arraycount(_iov_))
+
+static char banner[MAXBANNER];
+
+#define CLIENT_STATE_NEW	0
+#define CLIENT_STATE_RUNNING	1
+#define CLIENT_STATE_DYING	2
+
+struct sp_client;
+
+#define IOFLAG_STATUS_WAITING	0
+#define IOFLAG_STATUS_DONE	1
+#define IOFLAG_STATUS_FAILED	2
+
+struct ioflag {
+	int status;
+	struct thread *waiter;
+};
+
+struct iorespbuf {
+	uint64_t reqno;
+
+	struct rsp_hdr resp_hdr;
+	uint8_t *resp_data;
+	size_t resp_dlen;
+
+	TAILQ_ENTRY(iorespbuf) entries;
+	struct ioflag flag;
+};
+
+struct iosendbuf {
+	uint8_t *send_buf;
+	size_t send_len;
+
+	TAILQ_ENTRY(iosendbuf) entries;
+	struct ioflag flag;
+};
+
+struct ioreqbuf {
+	struct sp_client *cl;
+
+	struct rsp_hdr req_hdr;
+	uint8_t *req_data;
+	size_t req_dlen;
+	
+	struct thread *thr;
+};
+
+struct prefork {
+	uint32_t pf_auth[AUTHLEN];
+	struct lwp *pf_lwp;
+
+	LIST_ENTRY(prefork) pf_entries;		/* global list */
+	LIST_ENTRY(prefork) pf_clentries;	/* linked from forking spc */
+};
+static LIST_HEAD(, prefork) preforks = LIST_HEAD_INITIALIZER(preforks);
+
+struct sp_client {
+	int state;
+	int nthreads;
+	struct rumpsp_chan *chan;
+
+	struct rsp_hdr recv_hdr;
+	uint8_t *recv_buf;
+	size_t recv_off;
+
+	TAILQ_HEAD(, iosendbuf) sendqueue;
+	TAILQ_HEAD(, iorespbuf) respwaiter;
+
+	struct lwp *mainlwp;
+	pid_t pid;
+	uint64_t next_reqno;
+	
+	int inexec;
+	LIST_HEAD(, prefork) pflist;
+};
+
 
 /*
  * Manual wrappers, since librump does not have access to the
@@ -197,12 +172,12 @@ lwproc_release(void)
 }
 
 static int
-lwproc_rfork(void *ptr, int flags, const char *comm)
+lwproc_rfork(void *arg, int flags, const char *comm)
 {
 	int rv;
 
 	rumpuser__hyp.hyp_schedule();
-	rv = rumpuser__hyp.hyp_lwproc_rfork(ptr, flags, comm);
+	rv = rumpuser__hyp.hyp_lwproc_rfork(arg, flags, comm);
 	rumpuser__hyp.hyp_unschedule();
 
 	return rv;
@@ -277,178 +252,154 @@ rumpsyscall(int sysnum, void *data, register_t *regrv)
 	return rv;
 }
 
-static int
-enqueue_send(struct client *cli, struct iovec *iov, int iovcnt)
+static void
+ioflag_init(struct ioflag *flag)
 {
-	struct iovec *iov_base;
 
-	/* ensure client is not being polled */
-	assert(cli->poll_fd->fd < 0);
+	flag->status = IOFLAG_STATUS_WAITING;
+	flag->waiter = get_current();
+}
+
+static int
+ioflag_wait(struct ioflag *flag)
+{
+
+	while (flag->status == IOFLAG_STATUS_WAITING) {
+		block(flag->waiter);
+		schedule();
+	}
+
+	return (flag->status != IOFLAG_STATUS_DONE);
+}
+
+static void
+ioflag_signal(struct ioflag *flag)
+{
+	flag->status = IOFLAG_STATUS_DONE;
+	wake(flag->waiter);
+}
+
+static void
+ioflag_failed(struct ioflag *flag)
+{
+	flag->status = IOFLAG_STATUS_FAILED;
+	wake(flag->waiter);
+}
+
+static int
+ioflag_iswaiting(struct ioflag *flag)
+{
+	return flag->status == IOFLAG_STATUS_WAITING;
+}
+
+static void
+clfree(struct sp_client *cl)
+{
+	DPRINTF(("rump_sp: close client %p, pid %d\n", cl, cl->pid));
+	rumpsp_close(cl->chan);
+	free(cl);
+}
+
+static void
+disconnect(struct sp_client *cl)
+{
+	struct iorespbuf *respbuf, *tmpresp;
+	struct iosendbuf *sendbuf, *tmpsend; 
+
+	if (cl->state == CLIENT_STATE_DYING)
+		return;
+
+	cl->state = CLIENT_STATE_DYING;
+	rumpsp_disable_events(cl->chan, RUMPSP_EVENT_READABLE);
+	rumpsp_disable_events(cl->chan, RUMPSP_EVENT_WRITABLE);
+
+	TAILQ_FOREACH_SAFE(respbuf, &cl->respwaiter, entries, tmpresp) {
+		TAILQ_REMOVE(&cl->respwaiter, respbuf, entries);
+		ioflag_failed(&respbuf->flag);
+	}
+
+	TAILQ_FOREACH_SAFE(sendbuf, &cl->sendqueue, entries, tmpsend) {
+		TAILQ_REMOVE(&cl->sendqueue, sendbuf, entries);
+		ioflag_failed(&sendbuf->flag);
+	}
 	
-	if (iovcnt < 0)
-		return EINVAL;
-	
-	/* copy input, since it might outlive the caller */
-	iov_base = malloc(sizeof(*iov) * iovcnt);
-	if (iov_base == NULL)
+	if (cl->nthreads == 0) {
+		clfree(cl);
+	}
+}
+
+static int
+client_send(struct sp_client *cl, struct iovec *iov, size_t iovlen)
+{
+	int error;
+	size_t i, len, off;
+	uint8_t *buf;
+	struct iosendbuf sendbuf;
+
+	len = 0;
+	for (i = 0; i < iovlen; i++) {
+		len += iov[i].iov_len;
+	}
+
+	buf = malloc(len);
+	if (buf == NULL)
 		return ENOMEM;
 
-	memcpy(iov_base, iov, sizeof(*iov) * iovcnt);
+	off = 0;
+	for (i = 0; i < iovlen; i++) {
+		memcpy(buf + off, iov[i].iov_base, iov[i].iov_len);
+		off += iov[i].iov_len;
+	}
 
-	cli->send_iov = cli->send_iov_base = iov_base;
-	cli->send_iovcnt = iovcnt;
-	DPRINTF(("rump_sp: set to send for %d\n", cli->fd));
+	sendbuf.send_len = len;
+	sendbuf.send_buf = buf;
 
-	cli->poll_fd->events = POLLOUT;
-	cli->poll_fd->fd = cli->fd;
+	ioflag_init(&sendbuf.flag);
+
+	TAILQ_INSERT_TAIL(&cl->sendqueue, &sendbuf, entries);
+	rumpsp_enable_events(cl->chan, RUMPSP_EVENT_WRITABLE);
+
+	error = ioflag_wait(&sendbuf.flag);
+
+	free(buf);
+
+	return error;
+}
+
+static struct iorespbuf *
+client_enqueue_wait(struct sp_client *cl, uint64_t reqno)
+{
+	struct iorespbuf *respbuf;
+
+	respbuf = malloc(sizeof(*respbuf));
+	if (respbuf == NULL)
+		return NULL;
+
+	respbuf->reqno = reqno;
+	ioflag_init(&respbuf->flag);
+	TAILQ_INSERT_TAIL(&cl->respwaiter, respbuf, entries);
 	
-	return 0;
+	return respbuf;
 }
 
 static void
-reset_recv(struct client *cli)
+client_cancel_wait(struct sp_client *cl, struct iorespbuf *respbuf)
 {
-	free(cli->recv_buf);
-	cli->recv_buf = NULL;
-	cli->recv_off = 0;
+	if (ioflag_iswaiting(&respbuf->flag)) {
+		TAILQ_REMOVE(&cl->respwaiter, respbuf, entries);
+	}
 }
 
 static int
-handle_send(struct client *cli)
+client_wait(struct iorespbuf *respbuf)
 {
-	struct msghdr msg;
-	ssize_t nbytes = 0;
 
-	assert(cli->poll_fd->events == POLLOUT);
-
-	memset(&msg, 0, sizeof(msg));
-	msg.msg_iov = cli->send_iov;
-	msg.msg_iovlen = cli->send_iovcnt;
-
-	nbytes = sendmsg(cli->fd, &msg, MSG_NOSIGNAL);
-	DPRINTF(("rump_sp: sendmsg on fd %d returned %zd\n", cli->fd, nbytes));
-	if (nbytes == -1)  {
-		if (errno == EPIPE)
-			return ENOTCONN;
-		if (errno != EAGAIN)
-			return errno;
-		return  0;
-	}
-	if (nbytes == 0) {
-		return ENOTCONN;
-	}
-		
-	while ((nbytes >= (ssize_t)cli->send_iov[0].iov_len) 
-		&& cli->send_iovcnt)
-	{
-		nbytes -= cli->send_iov[0].iov_len;
-
-		cli->send_iov++;
-		cli->send_iovcnt--;
-	}
-	if (cli->send_iovcnt > 0) {
-		/* adjust left-overs */
-		cli->send_iov[0].iov_base = (void *)
-			((uint8_t *)cli->send_iov[0].iov_base + nbytes);
-		cli->send_iov[0].iov_len -= nbytes;
-	} else {
-		DPRINTF(("rump_sp: set to receive for %d\n", cli->fd));
-		/* cleanup, set to receive */
-		reset_recv(cli);
-		cli->poll_fd->events = POLLIN;
-		free(cli->send_iov_base);
-	}
-	
-	return 0;
+	return ioflag_wait(&respbuf->flag);
 }
+
 
 static int
-handle_recv(struct client *cli)
-{
-	int fd = cli->fd;
-	size_t left;
-	size_t framelen;
-	ssize_t n;
-	
-
-	assert(cli->poll_fd->events == POLLIN);
-
-	/* still reading header? */
-	if (cli->recv_off < HDRSZ) {
-		DPRINTF(("rump_sp: getting header at offset %zu\n",
-		    cli->recv_off));
-
-		left = HDRSZ - cli->recv_off;
-		/*LINTED: cast ok */
-		n = read(fd, (uint8_t*)&cli->recv_hdr + cli->recv_off, left);
-		if (n == 0) {
-			return -1;
-		}
-		if (n == -1) {
-			if (errno == EAGAIN)
-				return 0;
-			return -1;
-		}
-
-		cli->recv_off += n;
-		if (cli->recv_off < HDRSZ) {
-			return 0;
-		}
-
-		/*LINTED*/
-		framelen = cli->recv_hdr.rsp_len;
-
-		if (framelen < HDRSZ) {
-			return -1;
-		} else if (framelen == HDRSZ) {
-			goto success;
-		}
-
-		cli->recv_buf = malloc(framelen - HDRSZ);
-		if (cli->recv_buf == NULL) {
-			return -1;
-		}
-		memset(cli->recv_buf, 0, framelen - HDRSZ);
-
-		/* "fallthrough" */
-	} else {
-		/*LINTED*/
-		framelen = cli->recv_hdr.rsp_len;
-	}
-
-	left = framelen - cli->recv_off;
-
-#if 0
-	DPRINTF(("rump_sp: readframe getting body at offset %zu, left %zu\n",
-	    cli->recv_off, left));
-#endif
-	if (left == 0)
-		goto success;
-
-	n = read(fd, cli->recv_buf + (cli->recv_off - HDRSZ), left);
-	if (n == 0) {
-		return -1;
-	}
-	if (n == -1) {
-		if (errno == EAGAIN)
-			return 0;
-		return -1;
-	}
-	cli->recv_off += n;
-	left -= n;
-	
-	if (left > 0)
-		return 0;
-
-success:
-		DPRINTF(("rump_sp: disable polling for %d\n", cli->fd));
-		cli->poll_fd->fd = -1;
-		cli->poll_fd->events = 0;
-		return 1;
-}
-
-static void
-send_error_resp(struct client *cli, uint64_t reqno, enum rumpsp_err error)
+client_resp_error(struct sp_client *cl, uint64_t reqno, enum rumpsp_err error)
 {
 	struct rsp_hdr rhdr;
 	struct iovec iov[1];
@@ -461,11 +412,11 @@ send_error_resp(struct client *cli, uint64_t reqno, enum rumpsp_err error)
 
 	IOVPUT(iov[0], rhdr);
 
-	(void)SENDIOV(cli, iov);
+	return SENDIOV(cl, iov);
 }
 
 static int
-send_handshake_resp(struct client *cli, uint64_t reqno, int error)
+client_resp_handshake(struct sp_client *cl, uint64_t reqno, int error)
 {
 	struct rsp_hdr rhdr;
 	struct iovec iov[2];
@@ -479,14 +430,14 @@ send_handshake_resp(struct client *cli, uint64_t reqno, int error)
 
 	IOVPUT(iov[0], rhdr);
 	IOVPUT(iov[1], error);
-	
-	rv = SENDIOV(cli, iov);
-	
+
+	rv = SENDIOV(cl, iov);
+
 	return rv;
 }
 
 static int
-send_syscall_resp(struct client *cli, uint64_t reqno, int error,
+client_resp_syscall(struct sp_client *cl, uint64_t reqno, int error,
 	register_t *retval)
 {
 	struct rsp_hdr rhdr;
@@ -503,392 +454,724 @@ send_syscall_resp(struct client *cli, uint64_t reqno, int error,
 	sysresp.rsys_error = error;
 	memcpy(sysresp.rsys_retval, retval, sizeof(sysresp.rsys_retval));
 
-	DPRINTF(("rump_sp: syscall response of size %zu\n", rhdr.rsp_len));
-
 	IOVPUT(iov[0], rhdr);
 	IOVPUT(iov[1], sysresp);
 
-	rv = SENDIOV(cli, iov);
+	rv = SENDIOV(cl, iov);
 
 	return rv;
 }
 
-static void 
-handle_syscall(struct client *cli)
+
+static int
+client_resp_prefork(struct sp_client *cl, uint64_t reqno, uint32_t *auth)
 {
-	register_t retval[2] = {0, 0};
-	struct rsp_hdr *rhdr = &cli->recv_hdr;
-	uint8_t *data = cli->recv_buf;
-	int rv, sysnum;
+	struct rsp_hdr rhdr;
+	struct iovec iov[2];
+	int rv;
 
-	sysnum = (int)rhdr->rsp_sysnum;
-	DPRINTF(("rump_sp: handling syscall %d from client %d\n",
-	    sysnum, cli->spc_pid));
+	rhdr.rsp_len = sizeof(rhdr) + AUTHLEN*sizeof(*auth);
+	rhdr.rsp_reqno = reqno;
+	rhdr.rsp_class = RUMPSP_RESP;
+	rhdr.rsp_type = RUMPSP_PREFORK;
+	rhdr.rsp_sysnum = 0;
 
-	if (__predict_false((rv = lwproc_newlwp(cli->spc_pid)) != 0)) {
-		retval[0] = -1;
-		send_syscall_resp(cli, rhdr->rsp_reqno, rv, retval);
+	IOVPUT(iov[0], rhdr);
+	IOVPUT_WITHSIZE(iov[1], auth, AUTHLEN*sizeof(*auth));
+
+	rv = SENDIOV(cl, iov);
+
+	return rv;
+}
+
+static int
+client_copyin_req(struct sp_client *cl, const void *remaddr, size_t *dlen,
+	int wantstr, void **resp)
+{
+	struct rsp_hdr rhdr;
+	struct rsp_copydata copydata;
+	struct iorespbuf *respbuf;
+	struct iovec iov[2];
+	int rv;
+
+	DPRINTF(("copyin_req: %zu bytes from %p\n", *dlen, remaddr));
+
+	rhdr.rsp_len = sizeof(rhdr) + sizeof(copydata);
+	rhdr.rsp_reqno = cl->next_reqno++;
+	rhdr.rsp_class = RUMPSP_REQ;
+	if (wantstr)
+		rhdr.rsp_type = RUMPSP_COPYINSTR;
+	else
+		rhdr.rsp_type = RUMPSP_COPYIN;
+	rhdr.rsp_sysnum = 0;
+
+	copydata.rcp_addr = __UNCONST(remaddr);
+	copydata.rcp_len = *dlen;
+
+	respbuf = client_enqueue_wait(cl, rhdr.rsp_reqno);
+
+	IOVPUT(iov[0], rhdr);
+	IOVPUT(iov[1], copydata);
+
+	rv = SENDIOV(cl, iov);
+	if (rv) {
+		client_cancel_wait(cl, respbuf);
+		goto out;
+	}
+
+	rv = client_wait(respbuf);
+	if (rv)
+		goto out;
+
+	*resp = respbuf->resp_data;
+	if (wantstr)
+		*dlen = respbuf->resp_dlen;
+
+out:
+	free(respbuf);
+	return rv;
+
+}
+
+static int
+client_copyout_req(struct sp_client *cl, const void *remaddr,
+	const void *data, size_t dlen)
+{
+	struct rsp_hdr rhdr;
+	struct rsp_copydata copydata;
+	struct iovec iov[3];
+	int rv;
+
+	DPRINTF(("copyout_req (async): %zu bytes to %p\n", dlen, remaddr));
+
+	rhdr.rsp_len = sizeof(rhdr) + sizeof(copydata) + dlen;
+	rhdr.rsp_reqno = cl->next_reqno++;
+	rhdr.rsp_class = RUMPSP_REQ;
+	rhdr.rsp_type = RUMPSP_COPYOUT;
+	rhdr.rsp_sysnum = 0;
+
+	copydata.rcp_addr = __UNCONST(remaddr);
+	copydata.rcp_len = dlen;
+
+	IOVPUT(iov[0], rhdr);
+	IOVPUT(iov[1], copydata);
+	IOVPUT_WITHSIZE(iov[2], __UNCONST(data), dlen);
+
+	rv = SENDIOV(cl, iov);
+
+	return rv;
+}
+
+static int
+client_anonmmap_req(struct sp_client *cl, size_t howmuch, void **resp)
+{
+	struct rsp_hdr rhdr;
+	struct iorespbuf *respbuf;
+	struct iovec iov[2];
+	int rv;
+
+	DPRINTF(("anonmmap_req: %zu bytes\n", howmuch));
+
+	rhdr.rsp_len = sizeof(rhdr) + sizeof(howmuch);
+	rhdr.rsp_reqno = cl->next_reqno++;
+	rhdr.rsp_class = RUMPSP_REQ;
+	rhdr.rsp_type = RUMPSP_ANONMMAP;
+	rhdr.rsp_sysnum = 0;
+
+	IOVPUT(iov[0], rhdr);
+	IOVPUT(iov[1], howmuch);
+
+	respbuf = client_enqueue_wait(cl, rhdr.rsp_reqno);
+	rv = SENDIOV(cl, iov);
+	if (rv) {
+		client_cancel_wait(cl, respbuf);
+		goto out;
+	}
+
+	rv = client_wait(respbuf);
+	if (rv)
+		goto out;
+	
+	*resp = respbuf->resp_data;
+
+	DPRINTF(("anonmmap: mapped at %p\n", **(void ***)resp));
+
+out:
+	free(respbuf);
+	return rv;
+}
+
+static int
+client_raise_req(struct sp_client *cl, int signo)
+{
+	struct rsp_hdr rhdr;
+	struct iovec iov[1];
+	int rv;
+
+	rhdr.rsp_len = sizeof(rhdr);
+	rhdr.rsp_class = RUMPSP_REQ;
+	rhdr.rsp_type = RUMPSP_RAISE;
+	rhdr.rsp_signo = signo;
+
+	IOVPUT(iov[0], rhdr);
+
+	rv = SENDIOV(cl, iov);
+
+	return rv;
+}
+
+static void
+client_new_handshake(struct ioreqbuf *reqbuf)
+{
+	int error;
+	uint64_t reqno;
+	struct sp_client *cl = reqbuf->cl;
+
+	if (reqbuf->req_hdr.rsp_type != RUMPSP_HANDSHAKE) {
+		disconnect(cl);
 		return;
 	}
-	//cli->spc_syscallreq = rhdr->rsp_reqno;
-	rv = rumpsyscall(sysnum, data, retval);
+
+	reqno = reqbuf->req_hdr.rsp_reqno;
+
+	if (reqbuf->req_hdr.rsp_handshake == HANDSHAKE_GUEST) {
+		char *comm = (char *)reqbuf->req_data;
+		size_t commlen = reqbuf->req_dlen;
+
+		/* ensure it's 0-terminated */
+		/* XXX make sure it contains sensible chars? */
+		comm[commlen] = '\0';
+
+		/* make sure we fork off of proc1 */
+		_DIAGASSERT(lwproc_curlwp() == NULL);
+
+		if ((error = lwproc_rfork(cl,
+		    RUMP_RFFD_CLEAR, comm)) != 0) {
+		    	disconnect(cl);
+		    	return;
+		}
+
+		//spcfreebuf(spc);
+		if (error)
+			return;
+
+		cl->mainlwp = lwproc_curlwp();
+
+		client_resp_handshake(cl, reqno, 0);
+	} else if (reqbuf->req_hdr.rsp_handshake == HANDSHAKE_FORK) {
+		struct lwp *tmpmain;
+		struct prefork *pf;
+		struct handshake_fork *rfp;
+		int cancel;
+
+		if (reqbuf->req_dlen != sizeof(*rfp)) {
+			client_resp_error(cl, reqno,
+			    RUMPSP_ERR_MALFORMED_REQUEST);
+			disconnect(cl);
+			return;
+		}
+
+		/*LINTED*/
+		rfp = (void *)reqbuf->req_data;
+		cancel = rfp->rf_cancel;
+
+		LIST_FOREACH(pf, &preforks, pf_entries) {
+			if (memcmp(rfp->rf_auth, pf->pf_auth,
+			    sizeof(rfp->rf_auth)) == 0) {
+				LIST_REMOVE(pf, pf_entries);
+				LIST_REMOVE(pf, pf_clentries);
+				break;
+			}
+		}
+
+		if (!pf) {
+			client_resp_error(cl, reqno,
+			    RUMPSP_ERR_INVALID_PREFORK);
+			disconnect(cl);
+			return;
+		}
+
+		tmpmain = pf->pf_lwp;
+		free(pf);
+		lwproc_switch(tmpmain);
+		if (cancel) {
+			lwproc_release();
+			disconnect(cl);
+			return;
+		}
+
+		/*
+		 * So, we forked already during "prefork" to save
+		 * the file descriptors from a parent exit
+		 * race condition.  But now we need to fork
+		 * a second time since the initial fork has
+		 * the wrong spc pointer.  (yea, optimize
+		 * interfaces some day if anyone cares)
+		 */
+		if ((error = lwproc_rfork(cl,
+		    RUMP_RFFD_SHARE, NULL)) != 0) {
+			client_resp_error(cl, reqno,
+			    RUMPSP_ERR_RFORK_FAILED);
+			disconnect(cl);
+			lwproc_release();
+			return;
+		}
+		cl->mainlwp = lwproc_curlwp();
+		lwproc_switch(tmpmain);
+		lwproc_release();
+		lwproc_switch(cl->mainlwp);
+
+		client_resp_handshake(cl, reqno, 0);
+	} else {
+		client_resp_error(cl, reqno, RUMPSP_ERR_AUTH);
+		disconnect(cl);
+		return;
+	}
+
+	cl->pid = lwproc_getpid();
+
+	DPRINTF(("rump_sp: handshake for client %p complete, pid %d\n",
+		cl, cl->pid));
+
+	lwproc_switch(NULL);
+	cl->state = CLIENT_STATE_RUNNING;
+}
+
+static void
+client_prefork(struct ioreqbuf *reqbuf)
+{
+	struct sp_client *cl = reqbuf->cl;
+	struct prefork *pf;
+	uint32_t auth[AUTHLEN];
+	uint64_t reqno;
+	size_t randlen;
+	int error;
+
+	reqno = reqbuf->req_hdr.rsp_reqno;
+
+	DPRINTF(("rump_sp: prefork handler executing for %p\n", cl));
+
+	if (cl->inexec) {
+		client_resp_error(cl, reqno, RUMPSP_ERR_INEXEC);
+		disconnect(cl);
+		return;
+	}
+
+	pf = malloc(sizeof(*pf));
+	if (pf == NULL) {
+		client_resp_error(cl, reqno, RUMPSP_ERR_NOMEM);
+		return;
+	}
+
+	/*
+	 * Use client main lwp to fork.  this is never used by
+	 * worker threads (except in exec, but we checked for that
+	 * above) so we can safely use it here.
+	 */
+	lwproc_switch(cl->mainlwp);
+	if ((error = lwproc_rfork(cl, RUMP_RFFD_COPY, NULL)) != 0) {
+		DPRINTF(("rump_sp: fork failed: %d (%p)\n", error, cl));
+		client_resp_error(cl, reqno, RUMPSP_ERR_RFORK_FAILED);
+		lwproc_switch(NULL);
+		free(pf);
+		return;
+	}
+
+	/* Ok, we have a new process context and a new curlwp */
+	rumpuser_getrandom(auth, sizeof(auth), 0, &randlen);
+	memcpy(pf->pf_auth, auth, sizeof(pf->pf_auth));
+	pf->pf_lwp = lwproc_curlwp();
+	lwproc_switch(NULL);
+
+	LIST_INSERT_HEAD(&preforks, pf, pf_entries);
+	LIST_INSERT_HEAD(&cl->pflist, pf, pf_clentries);
+
+	DPRINTF(("rump_sp: prefork handler success %p\n", cl));
+
+	client_resp_prefork(cl, reqno, auth);
+}
+
+static void
+client_exec(struct ioreqbuf *reqbuf)
+{
+	struct sp_client *cl = reqbuf->cl;
+	uint64_t reqno = reqbuf->req_hdr.rsp_reqno;
+	char *comm = (char *)reqbuf->req_data;
+	size_t commlen = reqbuf->req_dlen;
+
+
+	if (reqbuf->req_hdr.rsp_handshake != HANDSHAKE_EXEC) {
+		client_resp_error(cl, reqno,
+		    RUMPSP_ERR_MALFORMED_REQUEST);
+		disconnect(cl);
+		return;
+	}
+
+	if (cl->inexec) {
+		client_resp_error(cl, reqno, RUMPSP_ERR_INEXEC);
+		disconnect(cl);
+		return;
+	}
+
+	cl->inexec = 1;
+
+	/*
+	 * start to drain lwps.  we will wait for it to finish
+	 * in another thread
+	 */
+	lwproc_switch(cl->mainlwp);
+	lwproc_lwpexit();
+	lwproc_switch(NULL);
+
+	while (cl->nthreads > 1) {
+		schedule();
+	}
+	
+	if (cl->state == CLIENT_STATE_RUNNING) {
+		comm[commlen] = '\0';
+
+		lwproc_switch(cl->mainlwp);
+		lwproc_execnotify(comm);
+		lwproc_switch(NULL);
+
+		cl->inexec = 0;
+		client_resp_handshake(cl, reqno, 0);
+	}
+}
+
+static void
+client_syscall(struct ioreqbuf *reqbuf)
+{
+	struct sp_client *cl = reqbuf->cl;
+	uint64_t reqno = reqbuf->req_hdr.rsp_reqno;
+	register_t retval[2] = {0, 0};
+	int rv, sysnum;
+
+	if (reqbuf->req_hdr.rsp_type != RUMPSP_SYSCALL) {
+		client_resp_error(cl, reqno, RUMPSP_ERR_MALFORMED_REQUEST);
+		return;
+	}
+
+	sysnum = (int)reqbuf->req_hdr.rsp_sysnum;
+	DPRINTF(("rump_sp: handling syscall %d from client %d\n",
+	    sysnum, cl->pid));
+
+	if ((rv = lwproc_newlwp(cl->pid)) != 0) {
+		retval[0] = -1;
+		client_resp_syscall(cl, reqno, rv, retval);
+		return;
+	}
+	
+	//cl->spc_syscallreq = rhdr->rsp_reqno;
+	rv = rumpsyscall(sysnum, reqbuf->req_data, retval);
 	//spc->spc_syscallreq = 0;
 	lwproc_release();
 
 	DPRINTF(("rump_sp: got return value %d & %d/%d\n",
 	    rv, retval[0], retval[1]));
 
-	send_syscall_resp(cli, rhdr->rsp_reqno, rv, retval);
+	client_resp_syscall(cl, reqno, rv, retval);
 }
 
 static void
-handle_req(struct client *cli)
+client_exitthread(struct sp_client *cl)
 {
-	uint64_t reqno;
-	int error;
+	cl->nthreads--;
 
-	DPRINTF(("rump_sp: handle req type: %"PRIu16" len: %"PRIu64" class: %"PRIu16" reqno: %"PRIu64"\n",
-		cli->recv_hdr.rsp_type,
-		cli->recv_hdr.rsp_len,
-		cli->recv_hdr.rsp_class,
-		cli->recv_hdr.rsp_reqno));
-
-	reqno = cli->recv_hdr.rsp_reqno;
-	if (__predict_false(cli->state == CLI_STATE_NEW)) {
-		if (cli->recv_hdr.rsp_type != RUMPSP_HANDSHAKE) {
-			//send_error_resp(spc, reqno, RUMPSP_ERR_AUTH);
-			shutdown(cli->fd, SHUT_RDWR);
-			//spcfreebuf(spc);*/
-			return;
-		}
-
-		if (cli->recv_hdr.rsp_handshake == HANDSHAKE_GUEST) {
-			char *comm = (char *)cli->recv_buf;
-			size_t commlen = cli->recv_hdr.rsp_len - HDRSZ;
-
-			/* ensure it's 0-terminated */
-			/* XXX make sure it contains sensible chars? */
-			comm[commlen] = '\0';
-
-			/* make sure we fork off of proc1 */
-			_DIAGASSERT(lwproc_curlwp() == NULL);
-
-			if ((error = lwproc_rfork(cli,
-			    RUMP_RFFD_CLEAR, comm)) != 0) {
-				shutdown(cli->fd, SHUT_RDWR);
-			}
-
-			//spcfreebuf(spc);
-			if (error)
-				return;
-
-			cli->spc_mainlwp = lwproc_curlwp();
-
-			send_handshake_resp(cli, reqno, 0);
-		} else if (cli->recv_hdr.rsp_handshake == HANDSHAKE_FORK) {
-			DPRINTF(("FORK HANDSHAKE\n"));
-#if 0
-			struct lwp *tmpmain;
-			struct prefork *pf;
-			struct handshake_fork *rfp;
-			int cancel;
-
-			if (spc->spc_off-HDRSZ != sizeof(*rfp)) {
-				send_error_resp(spc, reqno,
-				    RUMPSP_ERR_MALFORMED_REQUEST);
-				shutdown(spc->spc_fd, SHUT_RDWR);
-				spcfreebuf(spc);
-				return;
-			}
-
-			/*LINTED*/
-			rfp = (void *)spc->spc_buf;
-			cancel = rfp->rf_cancel;
-
-			pthread_mutex_lock(&pfmtx);
-			LIST_FOREACH(pf, &preforks, pf_entries) {
-				if (memcmp(rfp->rf_auth, pf->pf_auth,
-				    sizeof(rfp->rf_auth)) == 0) {
-					LIST_REMOVE(pf, pf_entries);
-					LIST_REMOVE(pf, pf_spcentries);
-					break;
-				}
-			}
-			pthread_mutex_unlock(&pfmtx);
-			spcfreebuf(spc);
-
-			if (!pf) {
-				send_error_resp(spc, reqno,
-				    RUMPSP_ERR_INVALID_PREFORK);
-				shutdown(spc->spc_fd, SHUT_RDWR);
-				return;
-			}
-
-			tmpmain = pf->pf_lwp;
-			free(pf);
-			lwproc_switch(tmpmain);
-			if (cancel) {
-				lwproc_release();
-				shutdown(spc->spc_fd, SHUT_RDWR);
-				return;
-			}
-
-			/*
-			 * So, we forked already during "prefork" to save
-			 * the file descriptors from a parent exit
-			 * race condition.  But now we need to fork
-			 * a second time since the initial fork has
-			 * the wrong spc pointer.  (yea, optimize
-			 * interfaces some day if anyone cares)
-			 */
-			if ((error = lwproc_rfork(spc,
-			    RUMP_RFFD_SHARE, NULL)) != 0) {
-				send_error_resp(spc, reqno,
-				    RUMPSP_ERR_RFORK_FAILED);
-				shutdown(spc->spc_fd, SHUT_RDWR);
-				lwproc_release();
-				return;
-			}
-			spc->spc_mainlwp = lwproc_curlwp();
-			lwproc_switch(tmpmain);
-			lwproc_release();
-			lwproc_switch(spc->spc_mainlwp);
-
-			send_handshake_resp(spc, reqno, 0);
-#endif
-		} else {
-			//send_error_resp(spc, reqno, RUMPSP_ERR_AUTH);
-			shutdown(cli->fd, SHUT_RDWR);
-			//spcfreebuf(spc);
-			return;
-		}
-
-		cli->spc_pid = lwproc_getpid();
-
-		DPRINTF(("rump_sp: handshake for client %p complete, pid %d\n",
-		    cli, cli->spc_pid));
-		    
-		lwproc_switch(NULL);
-		cli->state = CLI_STATE_RUNNING;
-		return;
-	}
-#if 0
-	if (__predict_false(spc->spc_hdr.rsp_type == RUMPSP_PREFORK)) {
-		struct prefork *pf;
-		uint32_t auth[AUTHLEN];
-		size_t randlen;
-		int inexec;
-
-		DPRINTF(("rump_sp: prefork handler executing for %p\n", spc));
-		spcfreebuf(spc);
-
-		pthread_mutex_lock(&spc->spc_mtx);
-		inexec = spc->spc_inexec;
-		pthread_mutex_unlock(&spc->spc_mtx);
-		if (inexec) {
-			send_error_resp(spc, reqno, RUMPSP_ERR_INEXEC);
-			shutdown(spc->spc_fd, SHUT_RDWR);
-			return;
-		}
-
-		pf = malloc(sizeof(*pf));
-		if (pf == NULL) {
-			send_error_resp(spc, reqno, RUMPSP_ERR_NOMEM);
-			return;
-		}
-
-		/*
-		 * Use client main lwp to fork.  this is never used by
-		 * worker threads (except in exec, but we checked for that
-		 * above) so we can safely use it here.
-		 */
-		lwproc_switch(spc->spc_mainlwp);
-		if ((error = lwproc_rfork(spc, RUMP_RFFD_COPY, NULL)) != 0) {
-			DPRINTF(("rump_sp: fork failed: %d (%p)\n",error, spc));
-			send_error_resp(spc, reqno, RUMPSP_ERR_RFORK_FAILED);
-			lwproc_switch(NULL);
-			free(pf);
-			return;
-		}
-
-		/* Ok, we have a new process context and a new curlwp */
-		rumpuser_getrandom(auth, sizeof(auth), 0, &randlen);
-		memcpy(pf->pf_auth, auth, sizeof(pf->pf_auth));
-		pf->pf_lwp = lwproc_curlwp();
-		lwproc_switch(NULL);
-
-		pthread_mutex_lock(&pfmtx);
-		LIST_INSERT_HEAD(&preforks, pf, pf_entries);
-		LIST_INSERT_HEAD(&spc->spc_pflist, pf, pf_spcentries);
-		pthread_mutex_unlock(&pfmtx);
-
-		DPRINTF(("rump_sp: prefork handler success %p\n", spc));
-
-		send_prefork_resp(spc, reqno, auth);
-		return;
+	/* last to leave cleans up */
+	if (cl->state == CLIENT_STATE_DYING && cl->nthreads == 0) {
+		clfree(cl);
 	}
 
-	if (__predict_false(spc->spc_hdr.rsp_type == RUMPSP_HANDSHAKE)) {
-		int inexec;
-
-		if (spc->spc_hdr.rsp_handshake != HANDSHAKE_EXEC) {
-			send_error_resp(spc, reqno,
-			    RUMPSP_ERR_MALFORMED_REQUEST);
-			shutdown(spc->spc_fd, SHUT_RDWR);
-			spcfreebuf(spc);
-			return;
-		}
-
-		pthread_mutex_lock(&spc->spc_mtx);
-		inexec = spc->spc_inexec;
-		pthread_mutex_unlock(&spc->spc_mtx);
-		if (inexec) {
-			send_error_resp(spc, reqno, RUMPSP_ERR_INEXEC);
-			shutdown(spc->spc_fd, SHUT_RDWR);
-			spcfreebuf(spc);
-			return;
-		}
-
-		pthread_mutex_lock(&spc->spc_mtx);
-		spc->spc_inexec = 1;
-		pthread_mutex_unlock(&spc->spc_mtx);
-
-		/*
-		 * start to drain lwps.  we will wait for it to finish
-		 * in another thread
-		 */
-		lwproc_switch(spc->spc_mainlwp);
-		lwproc_lwpexit();
-		lwproc_switch(NULL);
-
-		/*
-		 * exec has to wait for lwps to drain, so finish it off
-		 * in another thread
-		 */
-		schedulework(spc, SBA_EXEC);
-		return;
-	}
-#endif
-	if (__predict_false(cli->recv_hdr.rsp_type != RUMPSP_SYSCALL)) {
-		send_error_resp(cli, reqno, RUMPSP_ERR_MALFORMED_REQUEST);
-		//spcfreebuf(spc);
-		return;
-	}
-	
-	handle_syscall(cli);
+	exit_thread();
 }
 
-static unsigned int
-handle_conn(int fd)
+static void
+client_sendbanner(void *arg)
 {
-	int i, newfd, flags;
+	int rv;
+	struct sp_client *cl = arg;
 	struct iovec iov[1];
-	struct sockaddr_storage ss;
-	socklen_t sl = sizeof(ss);
-	
-	newfd = accept(fd, (struct sockaddr *)&ss, &sl);
-	if (newfd == -1)
-		return 0;
 
-	flags = fcntl(newfd, F_GETFL, 0);
-	if (fcntl(newfd, F_SETFL, flags | O_NONBLOCK) == -1) {
-		close(newfd);
-		return 0;
+	DPRINTF(("rump_sp: sending banner\n"));
+	IOVPUT_WITHSIZE(iov[0], banner, strlen(banner));
+
+	rv = SENDIOV(cl, iov);
+	
+	if (rv)
+		disconnect(cl);
+
+	client_exitthread(cl);
+}
+
+static void
+client_handlereq(void *arg)
+{
+	struct ioreqbuf *reqbuf = arg;
+	struct sp_client *cl = reqbuf->cl;
+	
+	DPRINTF(("rump_sp: handle request\n"));
+	
+	if (cl->state == CLIENT_STATE_NEW) {
+		client_new_handshake(reqbuf);
+	} else if (reqbuf->req_hdr.rsp_type == RUMPSP_PREFORK) {
+		client_prefork(reqbuf);
+	} else if (reqbuf->req_hdr.rsp_type == RUMPSP_HANDSHAKE) {
+		client_exec(reqbuf);
+	} else {
+		client_syscall(reqbuf);
 	}
 
-	/* grab first free slot */
-	for (i = 0; i < MAXCLI; i++) {
-		if (clilist[i].fd == -1)
+	free(reqbuf->req_data);
+	free(reqbuf);
+	
+	client_exitthread(cl);
+}
+
+static void
+donesend(struct sp_client *cl, int success)
+{
+	struct iosendbuf *sendbuf = TAILQ_FIRST(&cl->sendqueue);
+
+	assert(sendbuf != NULL);
+
+	TAILQ_REMOVE(&cl->sendqueue, sendbuf, entries);
+	if (TAILQ_EMPTY(&cl->sendqueue)) {
+		rumpsp_disable_events(cl->chan, RUMPSP_EVENT_WRITABLE);
+	}
+
+	if (success) {
+		ioflag_signal(&sendbuf->flag);
+	} else {
+		ioflag_failed(&sendbuf->flag);
+	}
+}
+
+static void
+dorequest(struct sp_client *cl)
+{
+	struct ioreqbuf *reqbuf;
+
+	reqbuf = malloc(sizeof(*reqbuf));
+	if (reqbuf == NULL) {
+		disconnect(cl);
+		return;
+	}
+	
+	cl->nthreads++;
+
+	reqbuf->cl = cl;
+	reqbuf->req_hdr = cl->recv_hdr;
+	reqbuf->req_data = cl->recv_buf;
+	reqbuf->req_dlen = cl->recv_hdr.rsp_len - HDRSZ;
+	reqbuf->thr = create_thread("rump_sp_reqhandler", NULL, 
+					client_handlereq, reqbuf, NULL, 0);
+}
+
+static void
+doresponse(struct sp_client *cl)
+{
+	struct iorespbuf *respbuf = NULL;
+
+	TAILQ_FOREACH(respbuf, &cl->respwaiter, entries) {
+		if (respbuf->reqno == cl->recv_hdr.rsp_reqno)
 			break;
 	}
 	
-	if (i == MAXCLI) {
-		/* EBUSY */
-		close(newfd);
-		return 0;
+	if (respbuf == NULL) {
+		disconnect(cl);
+		return;
 	}
 
-	pfdlist[i].fd = -1;
-	pfdlist[i].events = 0;
-	clilist[i].fd = newfd;
-	clilist[i].poll_fd = &pfdlist[i];
-	
-	IOVPUT_WITHSIZE(iov[0], &banner, strlen(banner));
-	SENDIOV(&clilist[i], iov);
+	respbuf->resp_hdr = cl->recv_hdr;
+	respbuf->resp_data = cl->recv_buf;
+	respbuf->resp_dlen = cl->recv_hdr.rsp_len - HDRSZ;
 
-	DPRINTF(("rump_sp: added new connection fd %d at idx %u\n", newfd, i));
+	TAILQ_REMOVE(&cl->respwaiter, respbuf, entries);
 
-	return i;
+	ioflag_signal(&respbuf->flag);
 }
 
+static void
+chanreadable(struct rumpsp_chan *chan, void *token)
+{
+	struct sp_client *cl = token;
+	size_t left;
+	size_t framelen;
+	ssize_t n;
 
+	/* still reading header? */
+	if (cl->recv_off < HDRSZ) {
+#if 1
+		DPRINTF(("rump_sp: reading header at offset %zu\n",
+			cl->recv_off));
+#endif
+
+		left = HDRSZ - cl->recv_off;
+		n = rumpsp_read(chan,
+				(uint8_t*)&cl->recv_hdr + cl->recv_off, left);
+		if (n == 0) {
+			disconnect(cl);
+			return;
+		}
+		if (n == -1) {
+			if (errno != EAGAIN) {
+				disconnect(cl);
+			}
+			return;
+		}
+
+		cl->recv_off += n;
+		if (cl->recv_off < HDRSZ) {
+			return;
+		}
+
+		/*LINTED*/
+		framelen = cl->recv_hdr.rsp_len;
+
+		if (framelen < HDRSZ) {
+			return;
+		} else if (framelen == HDRSZ) {
+			goto complete;
+		}
+
+		cl->recv_buf = malloc(framelen - HDRSZ);
+		if (cl->recv_buf == NULL) {
+			disconnect(cl);
+			return;
+		}
+
+		memset(cl->recv_buf, 0, framelen - HDRSZ);
+
+		/* "fallthrough" */
+	} else {
+		/*LINTED*/
+		framelen = cl->recv_hdr.rsp_len;
+	}
+
+	left = framelen - cl->recv_off;
+
+#if 1
+	DPRINTF(("rump_sp: reading body at offset %zu, left %zu\n",
+	    cl->recv_off, left));
+#endif
+	if (left == 0)
+		goto complete;
+
+	n = rumpsp_read(chan, cl->recv_buf + (cl->recv_off - HDRSZ), left);
+	if (n == 0) {
+		disconnect(cl);
+		return;
+	}
+	if (n == -1) {
+		if (errno != EAGAIN) {
+			free(cl->recv_buf);
+			disconnect(cl);
+		}
+		return;
+	}
+	cl->recv_off += n;
+	left -= n;
+	
+	if (left > 0)
+		return;
+
+complete:
+	DPRINTF(("rump_sp: read completed.\n"));
+	switch (cl->recv_hdr.rsp_class) {
+	case RUMPSP_RESP:
+		doresponse(cl);
+		break;
+	case RUMPSP_REQ:
+		dorequest(cl);
+		break;
+	default:
+		free(cl->recv_buf);
+		disconnect(cl);
+		break;
+	}
+	
+	cl->recv_buf = NULL;
+	cl->recv_off = 0;
+}
+
+static void
+chanwritable(struct rumpsp_chan *chan, void *token)
+{
+	struct sp_client *cl = token;
+	struct iosendbuf *sb;
+	ssize_t n;
+
+	sb = TAILQ_FIRST(&cl->sendqueue);
+	
+	DPRINTF(("rump_sp: writing buffer %p, length %zu\n", 
+			sb->send_buf, sb->send_len));
+	
+	n = rumpsp_write(chan, sb->send_buf, sb->send_len);
+	if (n == 0) {
+		return;
+	}
+	if (n == -1) {
+		if (errno != EAGAIN) {
+			donesend(cl, 0); // TODO should pass up errno for send
+		}
+		return;
+	}
+
+	sb->send_buf += n;
+	sb->send_len -= n;
+
+	if (sb->send_len > 0) {
+		return;
+	}
+
+	DPRINTF(("rump_sp: disable writing to %p\n", cl));
+	donesend(cl, 1);
+}
+
+static void
+chanaccepted(struct rumpsp_chan *chan, void **token)
+{
+	struct sp_client *cl;
+	
+	cl = malloc(sizeof(*cl));
+	if (cl == NULL) {
+		rumpsp_close(chan);
+		return;
+	}
+
+	memset(cl, 0, sizeof(*cl));
+
+	*token = cl;
+
+	cl->state = CLIENT_STATE_NEW;
+	cl->nthreads = 1;
+	cl->inexec = 0;
+	cl->chan = chan;
+
+	TAILQ_INIT(&cl->sendqueue);
+	TAILQ_INIT(&cl->respwaiter);
+	LIST_INIT(&cl->pflist);
+
+	rumpsp_enable_events(chan, RUMPSP_EVENT_READABLE);
+
+	create_thread("rump_sp_greeter", NULL, client_sendbanner, cl, NULL, 0);
+
+	DPRINTF(("rump_sp: accepted new client %p\n", cl));
+}
 
 static void
 mainloop(void *arg)
 {
-	int rv, seen;
-	unsigned int idx, maxidx, newidx;
-	struct spservarg *sarg = arg;
-	struct client *cli = NULL;
-
-	for (idx = 0; idx < MAXCLI; idx++) {
-		pfdlist[idx].fd = -1;
-		clilist[idx].fd = -1;
-	}
-
-	pfdlist[0].fd = clilist[0].fd = sarg->sps_sock;
-	pfdlist[0].events = POLLIN;
-	maxidx = 0;
+	int err;
 
 	DPRINTF(("rump_sp: server mainloop\n"));
 
 	for (;;) {
-		rv = poll(pfdlist, maxidx+1, 0);
-		
-		if (rv == 0) {
-			/* nothing to do */
-			schedule();
-			continue;
-		} else if (rv == -1) {
-			if(errno != EINTR) { // TODO handle EAGAIN?
-				fprintf(stderr, 
-					"rump_spserver: poll returned %d\n",
-			 		errno);
-			 	return;
-			}
-			continue;
-		}
-
-		seen = 0;
-		for (idx = 0; seen < rv && idx <= maxidx; idx++) {
-			if (!(pfdlist[idx].revents & (POLLIN|POLLOUT)))
-				continue;
-			seen++;
-			if (idx > 0) {
-				cli = &clilist[idx];
-				if (pfdlist[idx].revents & POLLIN) {
-					rv = handle_recv(cli);
-					if (rv == 1) {
-						handle_req(cli);
-					} else if (rv == -1) {
-						fprintf(stderr, 
-						"cannot receive");
-					}
-				} else if (pfdlist[idx].revents & POLLOUT) {
-					handle_send(cli);
-				}
-			} else {
-				DPRINTF(("rump_sp: handle new connection\n"));
-				newidx = handle_conn(pfdlist[0].fd);
-				
-				if (!newidx)
-					continue;
-				
-				if (newidx > maxidx)
-					maxidx = newidx;
-				DPRINTF(("rump_sp: maxid now %d\n", maxidx));
-			}
-		}
+		err = rumpsp_dispatch(10);
+		if (err)
+			return;
+		schedule();
 	}
 }
 
@@ -897,52 +1180,25 @@ int
 rumpuser_sp_init(const char *url,
 	const char *ostype, const char *osrelease, const char *machine)
 {
-	// TODO port parseurl() from sp_common
+	int err;
 	struct thread *thr;
-	struct spservarg *sarg;
-	struct sockaddr_un s_un;
-	socklen_t slen;
-	int error = 0, s;
+	struct rumpsp_handlers hndlrs;
 
 	snprintf(banner, sizeof(banner), "RUMPSP-%d.%d-%s-%s/%s\n",
-	    PROTOMAJOR, PROTOMINOR, ostype, osrelease, machine);
+	         PROTOMAJOR, PROTOMINOR, ostype, osrelease, machine);
 
-	s = socket(PF_LOCAL, SOCK_STREAM, 0);
-	if (s == -1) {
-		error = errno;
+	hndlrs.accepted = chanaccepted;
+	hndlrs.readable = chanreadable;
+	hndlrs.writable = chanwritable;
+
+	err = rumpsp_init_server(url, hndlrs);
+	if (err)
 		goto out;
-	}
 
-	sarg = malloc(sizeof(*sarg));
-	if (sarg == NULL) {
-		close(s);
-		error = ENOMEM;
-		goto out;
-	}
-
-	memset(&s_un, 0, sizeof(s_un));
-	s_un.sun_family = AF_LOCAL;
-	strcpy(s_un.sun_path, "/tmp/fibersock");
-	slen = strlen(s_un.sun_path) + sizeof(s_un.sun_family);
-	unlink(s_un.sun_path);
-
-	sarg->sps_sock = s;
-
-	if (bind(s, (struct sockaddr *)&s_un, slen) == -1) {
-		error = errno;
-		fprintf(stderr, "rump_sp: failed to bind to URL %s\n", url);
-		goto out;
-	}
-	if (listen(s, MAXCLI) == -1) {
-		error = errno;
-		fprintf(stderr, "rump_sp: server listen failed\n");
-		goto out;
-	}
-
-	thr = create_thread("rump_sp_server", NULL, mainloop, sarg, NULL, 0);
+	thr = create_thread("rump_sp_mainloop", NULL, mainloop, NULL, NULL, 0);
 	if (!thr) {
-		// TODO are there other reasons for failing?
-		error = ENOMEM;
+		err = ENOMEM;
+		goto out;
 	}
 	
 	// TODO figure out how to schedule server thread in background
@@ -950,60 +1206,128 @@ rumpuser_sp_init(const char *url,
 		schedule();
 	}
  out:
-	ET(error);
+	ET(err);
 }
 
 /*ARGSUSED*/
 void
 rumpuser_sp_fini(void *arg)
 {
-
+	rumpsp_cleanup();
 }
 
-/*ARGSUSED*/
-int
-rumpuser_sp_raise(void *arg, int signo)
+static int
+sp_copyin(void *arg, const void *raddr, void *laddr, size_t *len, int wantstr)
 {
+	struct sp_client *cl = arg;
+	void *rdata = NULL;
+	int rv, nlocks;
 
-	abort();
+	rumpkern_unsched(&nlocks, NULL);
+
+	rv = client_copyin_req(cl, raddr, len, wantstr, &rdata);
+	if (rv)
+		goto out;
+
+	memcpy(laddr, rdata, *len);
+	free(rdata);
+
+ out:
+	rumpkern_sched(nlocks, NULL);
+	if (rv)
+		rv = EFAULT;
+	ET(rv);
 }
 
-/*ARGSUSED*/
 int
 rumpuser_sp_copyin(void *arg, const void *raddr, void *laddr, size_t len)
 {
+	int rv;
 
-	abort();
+	rv = sp_copyin(arg, raddr, laddr, &len, 0);
+	ET(rv);
 }
 
-/*ARGSUSED*/
 int
 rumpuser_sp_copyinstr(void *arg, const void *raddr, void *laddr, size_t *len)
 {
+	int rv;
 
-	abort();
+	rv = sp_copyin(arg, raddr, laddr, len, 1);
+	ET(rv);
 }
 
-/*ARGSUSED*/
+static int
+sp_copyout(void *arg, const void *laddr, void *raddr, size_t dlen)
+{
+	struct sp_client *cl = arg;
+	int nlocks, rv;
+
+	rumpkern_unsched(&nlocks, NULL);
+	rv = client_copyout_req(cl, raddr, laddr, dlen);
+	rumpkern_sched(nlocks, NULL);
+
+	if (rv)
+		rv = EFAULT;
+	ET(rv);
+}
+
 int
 rumpuser_sp_copyout(void *arg, const void *laddr, void *raddr, size_t dlen)
 {
+	int rv;
 
-	abort();
+	rv = sp_copyout(arg, laddr, raddr, dlen);
+	ET(rv);
 }
 
-/*ARGSUSED*/
 int
 rumpuser_sp_copyoutstr(void *arg, const void *laddr, void *raddr, size_t *dlen)
 {
+	int rv;
 
-	abort();
+	rv = sp_copyout(arg, laddr, raddr, *dlen);
+	ET(rv);
 }
 
-/*ARGSUSED*/
 int
 rumpuser_sp_anonmmap(void *arg, size_t howmuch, void **addr)
 {
+	struct sp_client *cl = arg;
+	void *resp, *rdata = NULL; /* XXXuninit */
+	int nlocks, rv;
 
-	abort();
+	rumpkern_unsched(&nlocks, NULL);
+
+	rv = client_anonmmap_req(cl, howmuch, &rdata);
+	if (rv) {
+		rv = EFAULT;
+		goto out;
+	}
+
+	resp = *(void **)rdata;
+	free(rdata);
+
+	if (resp == NULL) {
+		rv = ENOMEM;
+	}
+
+	*addr = resp;
+
+ out:
+	rumpkern_sched(nlocks, NULL);
+	ET(rv);
+}
+
+int
+rumpuser_sp_raise(void *arg, int signo)
+{
+	struct sp_client *cl = arg;
+	int rv, nlocks;
+
+	rumpkern_unsched(&nlocks, NULL);
+	rv = client_raise_req(cl, signo);
+	rumpkern_sched(nlocks, NULL);
+
+	return rv;
 }
