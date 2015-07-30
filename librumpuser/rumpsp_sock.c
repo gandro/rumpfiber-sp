@@ -1,6 +1,9 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 
+#include <fcntl.h>
+#include <poll.h>
+
 #ifndef HOSTOPS
 #define host_poll poll
 #define host_read read
@@ -9,6 +12,8 @@
 #endif
 
 #include "sp_parse.c"
+
+#define RUMPSP_EAGAIN	EAGAIN
 
 #define MAXFDS 256
 
@@ -28,8 +33,6 @@ struct rumpsp_handlers {
 	rumpsp_callback_fn writable;
 	rumpsp_callback_fn readable;
 };
-
-
 
 static unsigned int protoidx;
 static struct sockaddr *protosa;
@@ -104,16 +107,52 @@ rumpsp_init_server(const char *url, struct rumpsp_handlers hndlrs)
 	return 0;
 }
 
-static ssize_t
-rumpsp_read(struct rumpsp_chan *chan, void *data, size_t size)
+static int
+rumpsp_read(struct rumpsp_chan *chan, void *data, size_t size, size_t *consumed)
 {
-	return read(chan->fd, data, size);
+	ssize_t n;
+	
+	n = read(chan->fd, data, size);
+	if (n > 0) {
+		*consumed = (size_t) n;
+		return 0;
+	}
+	
+	*consumed = 0;
+	
+	if (n == 0) {
+		return ENOTCONN;
+	}
+
+	if (errno == EAGAIN || errno == EINTR) {
+		return RUMPSP_EAGAIN;
+	}
+
+	return errno;
 }
 
-static ssize_t
-rumpsp_write(struct rumpsp_chan *chan, void *data, size_t size)
+static int
+rumpsp_write(struct rumpsp_chan *chan, void *data, size_t size, size_t *consumed)
 {
-	return write(chan->fd, data, size);
+	ssize_t n;
+
+	n = write(chan->fd, data, size);
+	if (n > 0) {
+		*consumed = (size_t) n;
+		return 0;
+	}
+
+	*consumed = 0;
+
+	if (n == 0) {
+		return ENOTCONN;
+	}
+
+	if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
+		return RUMPSP_EAGAIN;
+	}
+
+	return errno;
 }
 
 static void

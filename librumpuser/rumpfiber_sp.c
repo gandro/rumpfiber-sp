@@ -31,8 +31,6 @@
 #include <sys/queue.h>
 
 #include <assert.h>
-#include <fcntl.h>
-#include <poll.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdint.h>
@@ -996,9 +994,11 @@ static void
 chanreadable(struct rumpsp_chan *chan, void *token)
 {
 	struct sp_client *cl = token;
+	uint8_t *recv_hdr;
 	size_t left;
 	size_t framelen;
-	ssize_t n;
+	size_t n;
+	int err;
 
 	/* still reading header? */
 	if (cl->recv_off < HDRSZ) {
@@ -1008,14 +1008,10 @@ chanreadable(struct rumpsp_chan *chan, void *token)
 #endif
 
 		left = HDRSZ - cl->recv_off;
-		n = rumpsp_read(chan,
-				(uint8_t*)&cl->recv_hdr + cl->recv_off, left);
-		if (n == 0) {
-			disconnect(cl);
-			return;
-		}
-		if (n == -1) {
-			if (errno != EAGAIN) {
+		recv_hdr = (void*)&cl->recv_hdr;
+		err = rumpsp_read(chan, recv_hdr + cl->recv_off, left, &n);
+		if (err) {
+			if (err != RUMPSP_EAGAIN) {
 				disconnect(cl);
 			}
 			return;
@@ -1057,19 +1053,16 @@ chanreadable(struct rumpsp_chan *chan, void *token)
 #endif
 	if (left == 0)
 		goto complete;
-
-	n = rumpsp_read(chan, cl->recv_buf + (cl->recv_off - HDRSZ), left);
-	if (n == 0) {
-		disconnect(cl);
-		return;
-	}
-	if (n == -1) {
-		if (errno != EAGAIN) {
+	err = rumpsp_read(chan, cl->recv_buf + (cl->recv_off - HDRSZ),
+				left, &n);
+	if (err) {
+		if (err != RUMPSP_EAGAIN) {
 			free(cl->recv_buf);
 			disconnect(cl);
 		}
 		return;
 	}
+
 	cl->recv_off += n;
 	left -= n;
 	
@@ -1100,20 +1093,18 @@ chanwritable(struct rumpsp_chan *chan, void *token)
 {
 	struct sp_client *cl = token;
 	struct iosendbuf *sb;
-	ssize_t n;
+	size_t n;
+	int err;
 
 	sb = TAILQ_FIRST(&cl->sendqueue);
 	
 	DPRINTF(("rump_sp: writing buffer %p, length %zu\n", 
 			sb->send_buf, sb->send_len));
 	
-	n = rumpsp_write(chan, sb->send_buf, sb->send_len);
-	if (n == 0) {
-		return;
-	}
-	if (n == -1) {
-		if (errno != EAGAIN) {
-			donesend(cl, 0); // TODO should pass up errno for send
+	err = rumpsp_write(chan, sb->send_buf, sb->send_len, &n);
+	if (err) {
+		if (err != RUMPSP_EAGAIN) {
+			donesend(cl, 0);
 		}
 		return;
 	}
